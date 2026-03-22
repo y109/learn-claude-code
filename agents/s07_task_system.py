@@ -214,19 +214,21 @@ def agent_loop(messages: list):
             tools=TOOLS, max_tokens=8000,
         )
         messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        tool_blocks = [b for b in response.content if b.type == "tool_use"]
+        if not tool_blocks:
             return
         results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
-                try:
-                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                except Exception as e:
-                    output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+        for block in tool_blocks:
+            handler = TOOL_HANDLERS.get(block.name)
+            try:
+                output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+            except Exception as e:
+                output = f"Error: {e}"
+            print(f"> {block.name}: {str(output)[:200]}")
+            results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
         messages.append({"role": "user", "content": results})
+        if response.stop_reason != "tool_use":
+            return
 
 
 if __name__ == "__main__":

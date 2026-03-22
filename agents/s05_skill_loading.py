@@ -90,7 +90,7 @@ class SkillLoader:
         for name, skill in self.skills.items():
             desc = skill["meta"].get("description", "No description")
             tags = skill["meta"].get("tags", "")
-            line = f"  - {name}: {desc}"
+            line = f"  - {name}: {desc} (path: {skill['path']})"
             if tags:
                 line += f" [{tags}]"
             lines.append(line)
@@ -185,29 +185,67 @@ TOOLS = [
 ]
 
 
+import json as _json
+
+def _log(label: str, data):
+    """Pretty-print conversation log."""
+    CYAN, YELLOW, GREEN, RED, RESET = "\033[36m", "\033[33m", "\033[32m", "\033[31m", "\033[0m"
+    colors = {"REQUEST": CYAN, "RESPONSE": YELLOW, "TOOL_EXEC": GREEN, "TOOL_RESULT": RED}
+    color = colors.get(label, RESET)
+    print(f"\n{color}{'='*60}")
+    print(f"[{label}]")
+    print(f"{'='*60}{RESET}")
+    if isinstance(data, str):
+        print(data)
+    elif isinstance(data, list):
+        for item in data:
+            if hasattr(item, "type"):  # SDK object
+                if item.type == "text":
+                    print(f"  [text] {item.text[:300]}")
+                elif item.type == "tool_use":
+                    print(f"  [tool_use] {item.name}({_json.dumps(item.input, ensure_ascii=False)[:200]})")
+            elif isinstance(item, dict):
+                if item.get("type") == "tool_result":
+                    print(f"  [tool_result] id={item['tool_use_id'][:20]}... content={str(item['content'])[:200]}")
+                elif item.get("type") == "text":
+                    print(f"  [text] {item['text'][:200]}")
+    else:
+        print(str(data)[:500])
+    print()
+
+
 def agent_loop(messages: list):
+    round_num = 0
     while True:
+        round_num += 1
+        _log("REQUEST", f"Round {round_num} | messages count: {len(messages)} | last role: {messages[-1]['role']}")
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,
         )
+        _log("RESPONSE", f"stop_reason={response.stop_reason} | content blocks:")
+        _log("RESPONSE", response.content)
         messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        tool_blocks = [b for b in response.content if b.type == "tool_use"]
+        if not tool_blocks:
             return
         results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
-                try:
-                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                except Exception as e:
-                    output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+        for block in tool_blocks:
+            handler = TOOL_HANDLERS.get(block.name)
+            try:
+                output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+            except Exception as e:
+                output = f"Error: {e}"
+            _log("TOOL_EXEC", f"{block.name}({_json.dumps(block.input, ensure_ascii=False)[:200]})\n  → {str(output)[:300]}")
+            results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+        _log("TOOL_RESULT", results)
         messages.append({"role": "user", "content": results})
+        if response.stop_reason != "tool_use":
+            return
 
 
 if __name__ == "__main__":
+    print(f"\033[90m--- System Prompt ---\n{SYSTEM}\n--- End ---\033[0m\n")
     history = []
     while True:
         try:

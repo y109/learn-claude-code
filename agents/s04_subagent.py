@@ -121,15 +121,20 @@ def run_subagent(prompt: str) -> str:
             tools=CHILD_TOOLS, max_tokens=8000,
         )
         sub_messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        tool_blocks = [b for b in response.content if b.type == "tool_use"]
+        if not tool_blocks:
             break
         results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
+        for block in tool_blocks:
+            handler = TOOL_HANDLERS.get(block.name)
+            try:
                 output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)[:50000]})
+            except Exception as e:
+                output = f"Error: {e}"
+            results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)[:50000]})
         sub_messages.append({"role": "user", "content": results})
+        if response.stop_reason != "tool_use":
+            break
     # Only the final text returns to the parent -- child context is discarded
     return "".join(b.text for b in response.content if hasattr(b, "text")) or "(no summary)"
 
@@ -148,21 +153,29 @@ def agent_loop(messages: list):
             tools=PARENT_TOOLS, max_tokens=8000,
         )
         messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        tool_blocks = [b for b in response.content if b.type == "tool_use"]
+        if not tool_blocks:
             return
         results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                if block.name == "task":
-                    desc = block.input.get("description", "subtask")
-                    print(f"> task ({desc}): {block.input['prompt'][:80]}")
+        for block in tool_blocks:
+            if block.name == "task":
+                desc = block.input.get("description", "subtask")
+                print(f"> task ({desc}): {block.input['prompt'][:80]}")
+                try:
                     output = run_subagent(block.input["prompt"])
-                else:
-                    handler = TOOL_HANDLERS.get(block.name)
+                except Exception as e:
+                    output = f"Error: {e}"
+            else:
+                handler = TOOL_HANDLERS.get(block.name)
+                try:
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                print(f"  {str(output)[:200]}")
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+                except Exception as e:
+                    output = f"Error: {e}"
+            print(f"  {str(output)[:200]}")
+            results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
         messages.append({"role": "user", "content": results})
+        if response.stop_reason != "tool_use":
+            return
 
 
 if __name__ == "__main__":

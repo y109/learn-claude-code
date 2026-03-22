@@ -59,6 +59,9 @@ TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 KEEP_RECENT = 3
 
 
+DIM, CYAN, YELLOW, GREEN, RED, RESET = "\033[90m", "\033[36m", "\033[33m", "\033[32m", "\033[31m", "\033[0m"
+
+
 def estimate_tokens(messages: list) -> int:
     """Rough token count: ~4 chars per token."""
     return len(str(messages)) // 4
@@ -74,6 +77,7 @@ def micro_compact(messages: list) -> list:
                 if isinstance(part, dict) and part.get("type") == "tool_result":
                     tool_results.append((msg_idx, part_idx, part))
     if len(tool_results) <= KEEP_RECENT:
+        print(f"{DIM}[micro_compact] {len(tool_results)} tool_results ≤ {KEEP_RECENT}, skip{RESET}")
         return messages
     # Find tool_name for each result by matching tool_use_id in prior assistant messages
     tool_name_map = {}
@@ -86,25 +90,37 @@ def micro_compact(messages: list) -> list:
                         tool_name_map[block.id] = block.name
     # Clear old results (keep last KEEP_RECENT)
     to_clear = tool_results[:-KEEP_RECENT]
+    cleared = 0
     for _, _, result in to_clear:
         if isinstance(result.get("content"), str) and len(result["content"]) > 100:
             tool_id = result.get("tool_use_id", "")
             tool_name = tool_name_map.get(tool_id, "unknown")
+            old_len = len(result["content"])
             result["content"] = f"[Previous: used {tool_name}]"
+            cleared += 1
+            print(f"{YELLOW}[micro_compact] truncated {tool_name} result: {old_len} chars → placeholder{RESET}")
+    if cleared:
+        print(f"{YELLOW}[micro_compact] cleared {cleared}/{len(to_clear)} old results, kept recent {KEEP_RECENT}{RESET}")
     return messages
 
 
 # -- Layer 2: auto_compact - save transcript, summarize, replace messages --
 def auto_compact(messages: list) -> list:
+    tokens_before = estimate_tokens(messages)
+    msg_count = len(messages)
+    print(f"{RED}{'='*60}")
+    print(f"[auto_compact] TRIGGERED — {tokens_before} tokens, {msg_count} messages")
+    print(f"{'='*60}{RESET}")
     # Save full transcript to disk
     TRANSCRIPT_DIR.mkdir(exist_ok=True)
     transcript_path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
     with open(transcript_path, "w") as f:
         for msg in messages:
             f.write(json.dumps(msg, default=str) + "\n")
-    print(f"[transcript saved: {transcript_path}]")
+    print(f"{DIM}[auto_compact] transcript saved: {transcript_path}{RESET}")
     # Ask LLM to summarize
     conversation_text = json.dumps(messages, default=str)[:80000]
+    print(f"{DIM}[auto_compact] asking LLM to summarize ({len(conversation_text)} chars)...{RESET}")
     response = client.messages.create(
         model=MODEL,
         messages=[{"role": "user", "content":
@@ -114,11 +130,16 @@ def auto_compact(messages: list) -> list:
         max_tokens=2000,
     )
     summary = response.content[0].text
+    print(f"{GREEN}[auto_compact] summary ({len(summary)} chars):{RESET}")
+    print(f"{DIM}{summary[:500]}{'...' if len(summary) > 500 else ''}{RESET}")
     # Replace all messages with compressed summary
-    return [
+    new_messages = [
         {"role": "user", "content": f"[Conversation compressed. Transcript: {transcript_path}]\n\n{summary}"},
         {"role": "assistant", "content": "Understood. I have the context from the summary. Continuing."},
     ]
+    tokens_after = estimate_tokens(new_messages)
+    print(f"{GREEN}[auto_compact] {tokens_before} → {tokens_after} tokens ({msg_count} msgs → 2 msgs, {(1-tokens_after/tokens_before)*100:.0f}% reduced){RESET}")
+    return new_messages
 
 
 # -- Tool implementations --
@@ -193,40 +214,59 @@ TOOLS = [
 
 
 def agent_loop(messages: list):
+    round_num = 0
     while True:
+        round_num += 1
         # Layer 1: micro_compact before each LLM call
+        tokens_now = estimate_tokens(messages)
+        print(f"\n{CYAN}{'='*60}")
+        print(f"[Round {round_num}] messages={len(messages)}, ~{tokens_now} tokens, threshold={THRESHOLD}")
+        print(f"{'='*60}{RESET}")
         micro_compact(messages)
         # Layer 2: auto_compact if token estimate exceeds threshold
-        if estimate_tokens(messages) > THRESHOLD:
-            print("[auto_compact triggered]")
+        tokens_after_micro = estimate_tokens(messages)
+        if tokens_after_micro > THRESHOLD:
+            print(f"{RED}[auto_compact] tokens {tokens_after_micro} > {THRESHOLD}, triggering...{RESET}")
             messages[:] = auto_compact(messages)
+        else:
+            print(f"{DIM}[token check] {tokens_after_micro} ≤ {THRESHOLD}, no auto_compact needed{RESET}")
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,
         )
         messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        # Log response
+        print(f"{YELLOW}[response] stop_reason={response.stop_reason}{RESET}")
+        for block in response.content:
+            if hasattr(block, "text"):
+                print(f"{DIM}  [text] {block.text[:300]}{RESET}")
+            elif hasattr(block, "name"):
+                print(f"{DIM}  [tool_use] {block.name}({json.dumps(block.input, ensure_ascii=False)[:200]}){RESET}")
+        # Bedrock fix: check actual tool_use blocks, not just stop_reason
+        tool_blocks = [b for b in response.content if b.type == "tool_use"]
+        if not tool_blocks:
             return
         results = []
         manual_compact = False
-        for block in response.content:
-            if block.type == "tool_use":
-                if block.name == "compact":
-                    manual_compact = True
-                    output = "Compressing..."
-                else:
-                    handler = TOOL_HANDLERS.get(block.name)
-                    try:
-                        output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                    except Exception as e:
-                        output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+        for block in tool_blocks:
+            if block.name == "compact":
+                manual_compact = True
+                output = "Compressing..."
+            else:
+                handler = TOOL_HANDLERS.get(block.name)
+                try:
+                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                except Exception as e:
+                    output = f"Error: {e}"
+            print(f"{GREEN}> {block.name}: {str(output)[:200]}{RESET}")
+            results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
         messages.append({"role": "user", "content": results})
         # Layer 3: manual compact triggered by the compact tool
         if manual_compact:
-            print("[manual compact]")
+            print(f"{RED}[Layer 3: manual compact] model requested compression{RESET}")
             messages[:] = auto_compact(messages)
+        if response.stop_reason != "tool_use":
+            return
 
 
 if __name__ == "__main__":
