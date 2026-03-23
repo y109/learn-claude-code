@@ -193,26 +193,36 @@ def agent_loop(messages: list):
             notif_text = "\n".join(
                 f"[bg:{n['task_id']}] {n['status']}: {n['result']}" for n in notifs
             )
-            messages.append({"role": "user", "content": f"<background-results>\n{notif_text}\n</background-results>"})
-            messages.append({"role": "assistant", "content": "Noted background results."})
+            # 将通知合并到最后一条 user 消息（如果有），或单独追加
+            # 注意：不能伪造 assistant 消息，Bedrock 不支持 assistant prefill
+            if messages and messages[-1]["role"] == "user":
+                prev = messages[-1]["content"]
+                if isinstance(prev, str):
+                    messages[-1]["content"] = prev + f"\n\n<background-results>\n{notif_text}\n</background-results>"
+                elif isinstance(prev, list):
+                    prev.append({"type": "text", "text": f"<background-results>\n{notif_text}\n</background-results>"})
+            else:
+                messages.append({"role": "user", "content": f"<background-results>\n{notif_text}\n</background-results>"})
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,
         )
         messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        tool_blocks = [b for b in response.content if b.type == "tool_use"]
+        if not tool_blocks:
             return
         results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
-                try:
-                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                except Exception as e:
-                    output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+        for block in tool_blocks:
+            handler = TOOL_HANDLERS.get(block.name)
+            try:
+                output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+            except Exception as e:
+                output = f"Error: {e}"
+            print(f"> {block.name}: {str(output)[:200]}")
+            results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
         messages.append({"role": "user", "content": results})
+        if response.stop_reason != "tool_use":
+            return
 
 
 if __name__ == "__main__":

@@ -79,6 +79,13 @@ class MessageBus:
     def __init__(self, inbox_dir: Path):
         self.dir = inbox_dir
         self.dir.mkdir(parents=True, exist_ok=True)
+        self._wake_events = {}  # name -> threading.Event
+
+    def register(self, name: str) -> threading.Event:
+        """Register a wake event for a teammate."""
+        event = threading.Event()
+        self._wake_events[name] = event
+        return event
 
     def send(self, sender: str, to: str, content: str,
              msg_type: str = "message", extra: dict = None) -> str:
@@ -94,8 +101,11 @@ class MessageBus:
             msg.update(extra)
         inbox_path = self.dir / f"{to}.jsonl"
         with open(inbox_path, "a") as f:
-            f.write(json.dumps(msg) + "\n")
-        return f"Sent {msg_type} to {to}"
+            f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+        # 唤醒目标 teammate 的轮询线程
+        if to in self._wake_events:
+            self._wake_events[to].set()
+        return f"Sent {msg_type} to {to}: {content[:200]}"
 
     def read_inbox(self, name: str) -> list:
         inbox_path = self.dir / f"{name}.jsonl"
@@ -114,7 +124,8 @@ class MessageBus:
             if name != sender:
                 self.send(sender, name, content, "broadcast")
                 count += 1
-        return f"Broadcast to {count} teammates"
+        names = [n for n in teammates if n != sender]
+        return f"Broadcast to {count} teammates ({', '.join(names)}): {content[:200]}"
 
 
 BUS = MessageBus(INBOX_DIR)
@@ -131,8 +142,13 @@ class TeammateManager:
 
     def _load_config(self) -> dict:
         if self.config_path.exists():
-            return json.loads(self.config_path.read_text())
-        return {"team_name": "default", "members": []}
+            config = json.loads(self.config_path.read_text())
+        else:
+            config = {"team_name": "default", "members": []}
+        # 确保 lead 始终在成员列表中
+        if not any(m["name"] == "lead" for m in config["members"]):
+            config["members"].insert(0, {"name": "lead", "role": "team lead", "status": "working"})
+        return config
 
     def _save_config(self):
         self.config_path.write_text(json.dumps(self.config, indent=2))
@@ -170,10 +186,57 @@ class TeammateManager:
         )
         messages = [{"role": "user", "content": prompt}]
         tools = self._teammate_tools()
-        for _ in range(50):
+        wake_event = BUS.register(name)
+        idle = False
+        # 独立日志文件
+        log_dir = self.dir / "logs"
+        log_dir.mkdir(exist_ok=True)
+        log_path = log_dir / f"{name}.jsonl"
+        def log(event: str, data: dict = None):
+            entry = {"ts": time.strftime("%H:%M:%S"), "agent": name, "event": event}
+            if data:
+                entry["data"] = data
+            with open(log_path, "a") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        log("spawned", {"role": role, "prompt": prompt[:200]})
+        round_num = 0
+        for _ in range(200):
+            if idle:
+                log("idle_wait")
+                print(f"  [{name}] 💤 waiting for messages...")
+                woken = wake_event.wait(timeout=300)
+                if not woken:
+                    log("timeout_exit")
+                    print(f"  [{name}] ⏰ timeout, exiting")
+                    break
+                log("woken_up")
+                print(f"  [{name}] 🔔 woken up!")
+                wake_event.clear()
+            # 检查邮箱
             inbox = BUS.read_inbox(name)
-            for msg in inbox:
-                messages.append({"role": "user", "content": json.dumps(msg)})
+            if not inbox and idle:
+                continue
+            if inbox:
+                idle = False
+                print(f"  [{name}] 📬 got {len(inbox)} message(s)")
+                log("inbox_received", {"count": len(inbox), "messages": [m.get("content", "")[:100] for m in inbox]})
+                member = self._find_member(name)
+                if member:
+                    member["status"] = "working"
+                    self._save_config()
+                for msg in inbox:
+                    messages.append({"role": "user", "content": json.dumps(msg, ensure_ascii=False)})
+            round_num += 1
+            # 记录发给 LLM 的最后一条 user 消息
+            last_user = messages[-1] if messages else None
+            last_user_preview = ""
+            if last_user:
+                c = last_user.get("content", "")
+                if isinstance(c, str):
+                    last_user_preview = c[:200]
+                elif isinstance(c, list):
+                    last_user_preview = f"[{len(c)} tool_results]"
+            log("llm_request", {"round": round_num, "msg_count": len(messages), "last_user": last_user_preview})
             try:
                 response = client.messages.create(
                     model=MODEL,
@@ -182,22 +245,46 @@ class TeammateManager:
                     tools=tools,
                     max_tokens=8000,
                 )
-            except Exception:
+            except Exception as e:
+                log("llm_error", {"error": str(e)[:300]})
+                print(f"  [{name}] ❌ LLM error: {e}")
                 break
+            # 解析 response
+            text_parts = [b.text for b in response.content if hasattr(b, "text") and b.text]
+            tool_blocks = [b for b in response.content if b.type == "tool_use"]
+            log("llm_response", {
+                "round": round_num,
+                "stop_reason": response.stop_reason,
+                "text": " ".join(text_parts)[:300] if text_parts else None,
+                "tools": [{"name": b.name, "input": {k: str(v)[:80] for k, v in b.input.items()}} for b in tool_blocks],
+                "usage": {"input": response.usage.input_tokens, "output": response.usage.output_tokens},
+            })
             messages.append({"role": "assistant", "content": response.content})
-            if response.stop_reason != "tool_use":
-                break
+            if not tool_blocks:
+                member = self._find_member(name)
+                if member:
+                    member["status"] = "idle"
+                    self._save_config()
+                idle = True
+                continue
             results = []
-            for block in response.content:
-                if block.type == "tool_use":
-                    output = self._exec(name, block.name, block.input)
-                    print(f"  [{name}] {block.name}: {str(output)[:120]}")
-                    results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": str(output),
-                    })
+            for block in tool_blocks:
+                output = self._exec(name, block.name, block.input)
+                print(f"  [{name}] {block.name}: {str(output)[:120]}")
+                log("tool_exec", {"tool": block.name, "output": str(output)[:200]})
+                results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": str(output),
+                })
             messages.append({"role": "user", "content": results})
+            if response.stop_reason != "tool_use":
+                member = self._find_member(name)
+                if member:
+                    member["status"] = "idle"
+                    self._save_config()
+                idle = True
+        log("loop_exit", {"rounds": round_num})
         member = self._find_member(name)
         if member and member["status"] != "shutdown":
             member["status"] = "idle"
@@ -217,6 +304,8 @@ class TeammateManager:
             return BUS.send(sender, args["to"], args["content"], args.get("msg_type", "message"))
         if tool_name == "read_inbox":
             return json.dumps(BUS.read_inbox(sender), indent=2)
+        if tool_name == "list_teammates":
+            return TEAM.list_all()
         return f"Unknown tool: {tool_name}"
 
     def _teammate_tools(self) -> list:
@@ -233,6 +322,8 @@ class TeammateManager:
             {"name": "send_message", "description": "Send message to a teammate.",
              "input_schema": {"type": "object", "properties": {"to": {"type": "string"}, "content": {"type": "string"}, "msg_type": {"type": "string", "enum": list(VALID_MSG_TYPES)}}, "required": ["to", "content"]}},
             {"name": "read_inbox", "description": "Read and drain your inbox.",
+             "input_schema": {"type": "object", "properties": {}}},
+            {"name": "list_teammates", "description": "List all teammates with name, role, status.",
              "input_schema": {"type": "object", "properties": {}}},
         ]
 
@@ -344,16 +435,6 @@ TOOLS = [
 
 def agent_loop(messages: list):
     while True:
-        inbox = BUS.read_inbox("lead")
-        if inbox:
-            messages.append({
-                "role": "user",
-                "content": f"<inbox>{json.dumps(inbox, indent=2)}</inbox>",
-            })
-            messages.append({
-                "role": "assistant",
-                "content": "Noted inbox messages.",
-            })
         response = client.messages.create(
             model=MODEL,
             system=SYSTEM,
@@ -362,28 +443,42 @@ def agent_loop(messages: list):
             max_tokens=8000,
         )
         messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        tool_blocks = [b for b in response.content if b.type == "tool_use"]
+        if not tool_blocks:
             return
         results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
-                try:
-                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                except Exception as e:
-                    output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
-                results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": str(output),
-                })
+        for block in tool_blocks:
+            handler = TOOL_HANDLERS.get(block.name)
+            try:
+                output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+            except Exception as e:
+                output = f"Error: {e}"
+            print(f"> {block.name}: {str(output)[:200]}")
+            results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": str(output),
+            })
         messages.append({"role": "user", "content": results})
+        if response.stop_reason != "tool_use":
+            return
 
 
 if __name__ == "__main__":
+    # 为 lead 也注册 wake event
+    lead_event = BUS.register("lead")
     history = []
+    pending_inbox = []  # 缓存收到的邮箱消息
     while True:
+        # 等用户输入前，先检查 lead 邮箱（最多等 0.5 秒让 teammate 回复）
+        lead_event.wait(timeout=0.5)
+        lead_event.clear()
+        inbox = BUS.read_inbox("lead")
+        if inbox:
+            pending_inbox.extend(inbox)
+            print(f"\033[33m📬 收到 {len(inbox)} 条新消息:\033[0m")
+            for msg in inbox:
+                print(f"  [{msg.get('from','?')}] {msg.get('content','')[:200]}")
         try:
             query = input("\033[36ms09 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
@@ -394,9 +489,19 @@ if __name__ == "__main__":
             print(TEAM.list_all())
             continue
         if query.strip() == "/inbox":
-            print(json.dumps(BUS.read_inbox("lead"), indent=2))
+            if pending_inbox:
+                print(json.dumps(pending_inbox, indent=2))
+            else:
+                manual_inbox = BUS.read_inbox("lead")
+                print(json.dumps(manual_inbox, indent=2) if manual_inbox else "📭 收件箱为空")
             continue
-        history.append({"role": "user", "content": query})
+        # 将缓存的 inbox 消息和用户输入合并为一条 user message
+        user_content = query
+        if pending_inbox:
+            inbox_text = f"<inbox>{json.dumps(pending_inbox, indent=2)}</inbox>"
+            user_content = f"{inbox_text}\n\nUser says: {query}"
+            pending_inbox = []
+        history.append({"role": "user", "content": user_content})
         agent_loop(history)
         response_content = history[-1]["content"]
         if isinstance(response_content, list):
